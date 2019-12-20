@@ -14,13 +14,21 @@
             state: directory
           register: tmp_dir
 
+        - name: Download WMCB
+          get_url:
+            url: "{{ wmcb_url }}"
+            dest: "{{ tmp_dir.path }}/wmcb.exe"
+          when: wmcb_url is defined
+
         - name: Build WMCB
           make:
             target: build
             chdir: "{{ project_root }}"
+          when: wmcb_url is not defined
 
         - name: Move WMCB to temporary directory
           command: mv "{{ project_root }}/{{ wmcb_exe }}" "{{ tmp_dir.path }}/{{ wmcb_exe }}"
+          when: wmcb_url is not defined
 
         - name: Download Windows node kubelet
           get_url:

@@ -48,3 +48,12 @@ Run the WSU playbook:
 ```
 $ ansible-playbook -i hosts tasks/wsu/main.yaml -v
 ```
+To run WSU playbook with a pinned version of WMCB, provide argument `wmcb_url`
+  ```
+  $ ansible-playbook -i hosts tasks/wsu/main.yaml -v --extra-vars "wmcb_url=<wmcb_url>"
+  ```
+  Sample command with `wmcb_url`:
+  ```
+  $ ansible-playbook -i hosts tasks/wsu/main.yaml -v --extra-vars
+  "wmcb_url='https://github.com/openshift/windows-machine-config-operator/releases/download/0.2/wmcb.exe'"
+  ```
