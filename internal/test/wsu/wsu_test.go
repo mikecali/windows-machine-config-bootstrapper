@@ -2,6 +2,8 @@ package wsu
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -31,6 +33,8 @@ var (
 
 	// Temp directory ansible created on the windows host
 	ansibleTempDir = ""
+	// Temp directory ansible created on localhost
+	localTempDir = ""
 	// kubernetes-node-windows-amd64.tar.gz SHA512
 	// Value from https://github.com/kubernetes/kubernetes/blob/master/CHANGELOG-1.16.md#node-binaries-1
 	// This value should be updated when we change the kubelet version in WSU
@@ -57,6 +61,8 @@ var (
 	// remotePowerShellCmdPrefix holds the powershell prefix that needs to be prefixed to every command run on the
 	// remote powershell session opened
 	remotePowerShellCmdPrefix = "powershell.exe -NonInteractive -ExecutionPolicy Bypass "
+	// url for pinned wmcb
+	wmcbPinnedURL = "https://github.com/openshift/windows-machine-config-operator/releases/download/0.2/wmcb.exe"
 )
 
 // createhostFile creates an ansible host file and returns the path of it
@@ -82,6 +88,16 @@ ansible_winrm_server_cert_validation=ignore`, ip, password, clusterAddress))
 // behavior was achieved. The following environment variables must be set for this test to run: KUBECONFIG,
 // AWS_SHARED_CREDENTIALS_FILE, ARTIFACT_DIR, KUBE_SSH_KEY_PATH, WSU_PATH, CLUSTER_ADDR
 func TestWSU(t *testing.T) {
+	// test arguments for running WSU
+	type testArg struct {
+		// command that would run the playbook
+		cmd *exec.Cmd
+		// provided when using pinned version of wmcb
+		// when wmcb is build, the sha check would be done as a part of comparing the checksum of the files copied
+		expectedWmcbSha string
+		// ex sha256
+		shaType string
+	}
 	require.NotEmptyf(t, playbookPath, "WSU_PATH environment variable not set")
 	require.NotEmptyf(t, clusterAddress, "CLUSTER_ADDR environment variable not set")
 
@@ -89,8 +105,24 @@ func TestWSU(t *testing.T) {
 	// https://docs.ansible.com/ansible/latest/user_guide/intro_inventory.html
 	hostFilePath, err := createHostFile(framework.Credentials.GetIPAddress(), framework.Credentials.GetPassword())
 	require.NoErrorf(t, err, "Could not write to host file: %s", err)
-	cmd := exec.Command("ansible-playbook", "-vvv", "-i", hostFilePath, playbookPath)
-	out, err := cmd.CombinedOutput()
+
+	testWithPinnedWSU := testArg{
+		cmd:             exec.Command("ansible-playbook", "-vvv", "-i", hostFilePath, playbookPath,
+			"--extra-vars", "wmcb_url=" + wmcbPinnedURL),
+		expectedWmcbSha: "c36a4f0e1248d2b3498148354054c5c95a11aeac465ffb9dbc7ad14e8979a50b",
+		shaType:         "SHA256",
+	}
+	
+	//testWithBuiltWSU := testArg{
+	//	cmd:             exec.Command("ansible-playbook", "-vvv", "-i", hostFilePath, playbookPath),
+	//	expectedWmcbSha: "",
+	//	shaType:         "",
+	//}
+	//// populate localtempdir
+	//testWithBuiltWSU.expectedWmcbSha, err = getFileSha256(filepath.Join(localTempDir, "wmcb.exe"))
+	//require.NoErrorf(t, err, "could not get checksum of %s", filepath.Join(localTempDir, "wmcb.exe"))
+
+	out, err := testWithPinnedWSU.cmd.CombinedOutput()
 	require.NoError(t, err, "WSU playbook returned error: %s, with output: %s", err, string(out))
 
 	// Ansible will copy files to a temporary directory with a path such as:
@@ -98,6 +130,13 @@ func TestWSU(t *testing.T) {
 	initialSplit := strings.Split(string(out), "C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\Temp\\\\ansible.")
 	require.True(t, len(initialSplit) > 1, "Could not find Windows temp dir: %s", out)
 	ansibleTempDir = "C:\\Users\\Administrator\\AppData\\Local\\Temp\\ansible." + strings.Split(initialSplit[1], "\"")[0]
+
+	// check sha sum of downloaded wmcb
+	actualWmcbSha, err := getWinFileHash(filepath.Join(ansibleTempDir, "wmcb.exe"), testWithPinnedWSU.shaType)
+	require.NoErrorf(t, err, "could not generate %s of %s", testWithPinnedWSU.shaType,
+		filepath.Join(ansibleTempDir, "wmcb.exe"))
+	assert.Equalf(t, testWithPinnedWSU.expectedWmcbSha, actualWmcbSha, "could not match check sum of downloaded " +
+		"wmcb.exe")
 
 	t.Run("Files copied to Windows node", testFilesCopied)
 	t.Run("Pending CSRs were approved", testNoPendingCSRs)
@@ -109,6 +148,7 @@ func TestWSU(t *testing.T) {
 	t.Run("Check cni config generated on the Windows host", testCNIConfig)
 	t.Run("East-west networking", testEastWestNetworking)
 	t.Run("North-south networking", testNorthSouthNetworking)
+
 }
 
 // testCNIConfig tests if the CNI config has required hostsubnet and servicenetwork CIDR
@@ -158,19 +198,38 @@ func testFilesCopied(t *testing.T) {
 
 	// Check the SHA of kube.tar.gz downloaded
 	kubeTarPath := ansibleTempDir + "\\" + "kube.tar.gz"
+	actualKubeTarSha, err := getWinFileHash(kubeTarPath, "SHA512")
+	require.NoError(t, err, "could not compute SHA512 of %s", kubeTarPath)
+	assert.Equal(t, expectedKubeTarSha, actualKubeTarSha,
+		"kube.tar.gz downloaded does not match expected checksum")
+}
+
+// getWinFileHash computes hash of a given file on Windows instance and returns the checksum as a string
+// hashType should be the hash algorithm to be computed
+func getWinFileHash(path string, hashType string) (string, error){
 	// certutil is part of default OS installation Windows 7+
-	command := fmt.Sprintf("certutil -hashfile %s SHA512", kubeTarPath)
+	command := fmt.Sprintf("certutil -hashfile %s %s", path, hashType)
 	stdout := new(bytes.Buffer)
 	stderr := new(bytes.Buffer)
 	_, err := framework.WinrmClient.Run(command, stdout, stderr)
-	require.NoError(t, err, "Error generating SHA512 for %s", kubeTarPath)
-	require.Equalf(t, stderr.Len(), 0, "Error generating SHA512 for %s", kubeTarPath)
+	if err != nil || stderr.Len() != 0 {
+		return "", err
+	}
 	// CertUtil output example:
 	// SHA512 hash of <filepath>:\r\n<SHA-output>\r\nCertUtil: -hashfile command completed successfully.
-	// Extracting SHA value from the output
-	actualKubeTarSha := strings.Split(stdout.String(), "\r\n")[1]
-	assert.Equal(t, expectedKubeTarSha, actualKubeTarSha,
-		"kube.tar.gz downloaded does not match expected checksum")
+	// Extracting Hash value from the output
+	return strings.Split(stdout.String(), "\r\n")[1], err
+}
+
+// getFileSha256 calculates the SHA256 checksum of a given file
+func getFileSha256(path string) (string, error){
+	hasher := sha256.New()
+	s, err := ioutil.ReadFile(path)
+	hasher.Write(s)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), err
 }
 
 // testNodeReady tests that the bootstrapped node was added to the cluster and is in the ready state
