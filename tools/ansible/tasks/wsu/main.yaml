@@ -2,8 +2,13 @@
 - hosts: localhost
   vars:
     project_root: "{{ playbook_dir }}/../../../.."
-    kubelet_location: "https://dl.k8s.io/v1.16.2/kubernetes-node-windows-amd64.tar.gz"
     wmcb_exe: "wmcb.exe"
+    hybrid_overlay_exe : "hybrid-overlay.exe"
+    build: False
+    map_kubernetes_to_openshift_version:
+      '1.16': 4.3
+      '1.17': 4.4
+      '1.18': 4.5
 
   tasks:
     - name: Create directory to store files to be used later
@@ -11,28 +16,110 @@
         state: directory
       register: tmp_dir
 
-    - name: Build WMCB
-      when: wmcb_url is undefined
-      block:
-        - name: Build WMCB
-          make:
-            target: build
-            chdir: "{{ project_root }}"
+    - name: Get kubernetes version
+      shell: "oc version -o json | jq -r '.serverVersion.gitVersion'"
+      register: kubernetes_version
 
-        - name: Move WMCB to temporary directory
-          command: mv "{{ project_root }}/{{ wmcb_exe }}" "{{ tmp_dir.path }}/{{ wmcb_exe }}"
+    - name: Get kubelet download url
+      shell: "echo https://dl.k8s.io/{{ kubernetes_version.stdout }}/kubernetes-node-windows-amd64.tar.gz"
+      register: kubelet_location
+
+    - name: Get kubernetes version without patch version
+      shell: "version={{ kubernetes_version.stdout }} ; echo ${version%.*} | tr -d v"
+      register: kubernetes_version_without_patch
+
+    - name: Get kubernetes changelog url
+      shell: |
+        echo "https://github.com/kubernetes/kubernetes/blob/release-"\
+        "{{ kubernetes_version_without_patch.stdout }}/CHANGELOG/CHANGELOG-"\
+        "{{ kubernetes_version_without_patch.stdout }}.md"
+      register: changelog
+
+    - name: Get kube node binary SHA
+      shell: |
+        curl -s "{{ changelog.stdout }}" | \
+        grep -A 1 "{{ kubernetes_version.stdout }}" | \
+        grep -A 1 node-windows | tail -n 1 | sed -e 's/.*<code>\(.*\)<\/code>.*/\1/'
+      register: kube_node_sha
+
+    - name: Register cluster version
+      shell: "echo {{ map_kubernetes_to_openshift_version[kubernetes_version_without_patch.stdout] }}"
+      register: cluster_version
+
+    # curl -s https://api.github.com/repos/openshift/windows-machine-config-operator/releases gets the list of all
+    # releases, we use the cluster version from previous ansible task to select the release we need.
+    - name: Get release
+      shell: |
+        RELEASES="$(curl -s https://api.github.com/repos/openshift/windows-machine-config-operator/releases)"
+        TAGNAME="$(echo $RELEASES | jq '.[]' | jq '.tag_name' | \
+        grep -i {{ cluster_version.stdout }} |\
+        sort -r | awk 'NR==1')"
+        echo $RELEASES | \
+        jq '.[] | select (.tag_name == '$TAGNAME')'
+      register: release
 
     - name: Gather required files
       block:
-        - name: Download WMCB
-          when: wmcb_url is defined
-          get_url:
-            url: "{{ wmcb_url }}"
-            dest: "{{ tmp_dir.path }}/wmcb.exe"
+        - name: Build WMCB
+          when: build
+          block:
+            - name: Build WMCB
+              make:
+                target: build
+                chdir: "{{ project_root }}"
+
+            - name: Move WMCB to temporary directory
+              command: mv "{{ project_root }}/{{ wmcb_exe }}" "{{ tmp_dir.path }}/{{ wmcb_exe }}"
+
+        - name: Download WMCB binary
+          when: not build
+          block:
+            # The wmcb release tags are supposed to conform to the following semver format:
+            # v<openshift-major-version>.<openshift-minor-version>.<wmcb_build_number>-<release_type>. For example, v4.4-1-alpha.
+            # For a <openshift-major-version>.<openshift-minor-version>, there can be many wmcb builds available, for
+            # example, OpenShift 4.4 can map to v4.4.1-alpha and v4.4.2-alpha, we will always pick up the latest build available
+            # which is v4.4.2-alpha,
+            # In future, when we cut beta and GA releases, the playbook should always go for GA version when available.
+            - name: Get wmcb url
+              shell: |
+                echo '{{ release.stdout }}' | \
+                jq ' .assets[] | select (.name == "{{ wmcb_exe }}" )' | \
+                jq -r .browser_download_url
+              register: wmcb_download_url
+
+            # We'll get the SHA associated with the wmcb.exe in the body of the release tag.
+            - name: Get the SHA for wmcb binary. We assume that body of WMCB release has the info.
+              shell: |
+                echo '{{ release.stdout }}' | \
+                jq -r .body | \
+                grep -i {{ wmcb_exe }}| \
+                awk '{print $1}'
+              register: wmcb_sha
+
+            - name: Download WMCB
+              get_url:
+                url: "{{ wmcb_download_url.stdout }}"
+                dest: "{{ tmp_dir.path }}/wmcb.exe"
+
+        - name: Get hybrid overlay url
+          shell: |
+            echo '{{ release.stdout }}' | \
+            jq ' .assets[] | select (.name == "{{ hybrid_overlay_exe }}" )' | \
+            jq -r .browser_download_url
+          register: hybrid_overlay_download_url
+
+        # We'll get the SHA associated with the hybrid_overlay.exe in the body of the release tag.
+        - name: Get the SHA for hybrid-overlay binary. We assume that body of WMCB release has the info.
+          shell: |
+            echo '{{ release.stdout }}' | \
+            jq -r .body | \
+            grep -i {{ hybrid_overlay_exe }}| \
+            awk '{print $1}'
+          register: hybrid_overlay_sha
 
         - name: Download Windows node kubelet
           get_url:
-            url: "{{ kubelet_location }}"
+            url: "{{ kubelet_location.stdout }}"
             dest: "{{ tmp_dir.path }}/kube.tar.gz"
 
         - name: Extract kubernetes node binaries
@@ -64,8 +151,7 @@
 - hosts: win
   vars:
     tmp_path: "{{ playbook_dir }}/tmp"
-    hybrid_overlay_exe : "hybrid-overlay.exe"
-    ovn_annotation: "{{ 'hostsubnet' if  ( cluster_version.stdout  == '4.3' ) else  'node-subnet' }}"
+    ovn_annotation: "{{ 'hostsubnet' if  ( hostvars['localhost']['cluster_version']['stdout']  == '4.3' ) else  'node-subnet' }}"
 
   tasks:
     - name: Create temporary directory
@@ -88,75 +174,28 @@
         dest: "{{ win_temp_dir.path }}\\worker.ign"
         validate_certs: no
 
-    - name: Get kubernetes version
-      delegate_to: localhost
-      shell: "oc version -o json | jq -r '.serverVersion.minor' | tr -d +"
-      register: kubernetes_version
-
-    # This translates a kubernetes version to an OpenShift version. This works under the assumption that each OpenShift
-    # release corresponds with a kubernetes release. This is being done this way, and not with oc get clusterversion,
-    # as OpenShift CI doesn't have the actual version attached to its clusters, instead replacing it with 0.0.1 and
-    # information about the release creation date
-    - name: Get cluster version
-      delegate_to: localhost
-      shell: |
-        MINORVERSION={{ kubernetes_version.stdout }}
-        BASEK8SVERSION=16
-        BASEOPENSHIFTVERSION=3
-        if [ \"$MINORVERSION\" -lt \"$BASEK8SVERSION\" ]; then
-        echo unsupported kubernetes version; exit 1
-        fi
-        VERSIONINCREMENTS=$((MINORVERSION - BASEK8SVERSION))
-        echo 4.$((BASEOPENSHIFTVERSION + VERSIONINCREMENTS))
-        exit 0
-      register: cluster_version
-
-    # curl -s https://api.github.com/repos/openshift/windows-machine-config-operator/releases gets the list of all
-    # releases, we use the cluster version from previous ansible task to select the release we need.
-    - name: Get release
-      delegate_to: localhost
-      shell: |
-        RELEASES="$(curl -s https://api.github.com/repos/openshift/windows-machine-config-operator/releases)"
-        TAGNAME="$(echo $RELEASES | jq '.[]' | jq '.tag_name' | grep -i {{ cluster_version.stdout }} | sort -r | awk 'NR==1')"
-        echo $RELEASES | \
-        jq '.[] | select (.tag_name == '$TAGNAME')'
-      register: release
-
-    # The wmcb release tags are supposed to conform to the following semver format:
-    # v<openshift-major-version>.<openshift-minor-version>.<wmcb_build_number>-<release_type>. For example, v4.4-1-alpha.
-    # For a <openshift-major-version>.<openshift-minor-version>, there can be many wmcb builds available, for
-    # example, OpenShift 4.4 can map to v4.4.1-alpha and v4.4.2-alpha, we will always pick up the latest build available
-    # which is v4.4.2-alpha,
-    # In future, when we cut beta and GA releases, the playbook should always go for GA version when available.
-    - name: Get hybrid overlay url
-      delegate_to: localhost
-      shell: |
-        echo '{{ release.stdout }}' | \
-        jq ' .assets[] | select (.name == "{{ hybrid_overlay_exe }}" )' | \
-        jq -r .browser_download_url
-      register: hybrid_overlay_download_url
-
     - name: Get hybrid overlay exe
       win_get_url:
-        url: "{{ hybrid_overlay_download_url.stdout }}"
+        url: "{{ hostvars['localhost']['hybrid_overlay_download_url']['stdout'] }}"
         dest: "{{ win_temp_dir.path }}\\hybrid-overlay.exe"
         follow_redirects: all
 
-    # We'll get the SHA associated with the hybrid_overlay.exe in the body of the release tag.
-    - name: Get the SHA for the given binary. We assume that body of WMCB release has the info.
-      delegate_to: localhost
-      shell: |
-        echo '{{ release.stdout }}' | \
-        jq -r .body | \
-        grep -i {{ hybrid_overlay_exe }}| \
-        awk '{print $1}'
-      register: hybrid_overlay_sha
+    - name: Check kube node binary SHA512
+      win_shell: "certutil -hashfile {{ win_temp_dir.path }}\\kube.tar.gz sha512"
+      register: kube_node_sha512
+      failed_when: "kube_node_sha512.stdout_lines[1] != hostvars['localhost']['kube_node_sha']['stdout']"
 
     # TODO: Remove this, win_get_url already has checksum, we can use it.
     - name: Check hybrid overlay SHA256
       win_shell: "certutil -hashfile {{ win_temp_dir.path }}\\hybrid-overlay.exe sha256"
       register: hybrid_sha256
-      failed_when: "hybrid_sha256.stdout_lines[1] != hybrid_overlay_sha.stdout "
+      failed_when: "hybrid_sha256.stdout_lines[1] != hostvars['localhost']['hybrid_overlay_sha']['stdout']"
+
+    - name: Check wmcb SHA256
+      when: wmcb_sha is defined
+      win_shell: "certutil -hashfile {{ win_temp_dir.path }}\\wmcb.exe sha256"
+      register: wmcb_sha256
+      failed_when: "wmcb_sha256.stdout_lines[1] != hostvars['localhost']['wmcb_sha']['stdout']"
 
     - name: Run bootstrapper
       win_shell: "{{ win_temp_dir.path }}\\wmcb.exe initialize-kubelet --ignition-file {{ win_temp_dir.path }}\\worker.ign --kubelet-path {{ win_temp_dir.path }}\\kubelet.exe"
