@@ -49,6 +49,11 @@ Run the WSU playbook:
 $ ansible-playbook -i hosts tasks/wsu/main.yaml -v
 ```
 
+A specific WMCB version can be used by specifying its URL when running the playbook
+```
+$ ansible-playbook -i hosts tasks/wsu/main.yaml -v -e wmcb_url=<location_of_wmcb>
+```
+
 ### End to end testing
 The following environment variables need to be set for running the end to end tests of the playbook:
 - ARTIFACT_DIR
